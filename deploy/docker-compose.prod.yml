@@ -1,0 +1,54 @@
+# Compose untuk VPS (produksi). Tidak ada build di sini:
+# semua image di-pull dari registry hasil pipeline GitHub Actions.
+# Nilai ${...} dibaca dari file .env di folder yang sama (lihat .env.example).
+name: todo-app
+
+services:
+  mysql:
+    image: ${IMAGE_PREFIX}/todo-mysql:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?isi MYSQL_ROOT_PASSWORD di .env}
+      MYSQL_DATABASE: ${DB_NAME:-tododb}
+      MYSQL_USER: ${DB_USER:-todo}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?isi DB_PASSWORD di .env}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks: [todo-net]
+    # Port 3306 sengaja TIDAK dibuka ke internet
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  backend:
+    image: ${IMAGE_PREFIX}/todo-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_NAME: ${DB_NAME:-tododb}
+      DB_USER: ${DB_USER:-todo}
+      DB_PASSWORD: ${DB_PASSWORD}
+    networks: [todo-net]
+    # Port 5000 juga tidak dibuka; backend hanya diakses lewat nginx di frontend
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  frontend:
+    image: ${IMAGE_PREFIX}/todo-frontend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-80}:80"
+    networks: [todo-net]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+networks:
+  todo-net:
+
+volumes:
+  mysql-data:

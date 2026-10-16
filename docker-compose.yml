@@ -1,0 +1,52 @@
+# Compose untuk development lokal dan integration test di GitHub Actions.
+# Image di-build dari source code di repo ini.
+#   docker compose up -d --build      (atau: podman compose up -d --build)
+name: todo-app
+
+services:
+  mysql:
+    build: ./mysql
+    image: todo-mysql:local
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass-dev}
+      MYSQL_DATABASE: ${DB_NAME:-tododb}
+      MYSQL_USER: ${DB_USER:-todo}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-todopass-dev}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks: [todo-net]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  backend:
+    build: ./backend
+    image: todo-backend:local
+    environment:
+      DB_HOST: mysql
+      DB_NAME: ${DB_NAME:-tododb}
+      DB_USER: ${DB_USER:-todo}
+      DB_PASSWORD: ${DB_PASSWORD:-todopass-dev}
+    networks: [todo-net]
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    image: todo-frontend:local
+    ports:
+      - "3000:80"
+    networks: [todo-net]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+networks:
+  todo-net:
+
+volumes:
+  mysql-data:

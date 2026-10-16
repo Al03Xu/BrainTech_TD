@@ -1,0 +1,225 @@
+# Pipeline CI/CD To-Do-App
+#
+# Pull request ke main : unit test -> build frontend -> integration test (3 container)
+# Push / merge ke main : semua langkah di atas, lalu
+#                        build & push 3 image ke Docker Hub + GHCR -> deploy ke VPS
+#
+# Secrets yang wajib diisi (Settings > Secrets and variables > Actions):
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, VPS_HOST, VPS_USER, VPS_SSH_KEY
+# Opsional: VPS_PORT (default 22)
+# Variable (bukan secret): DEPLOY_ENABLED=true untuk menyalakan job deploy
+
+name: CI-CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- CI
+  backend-test:
+    name: Backend unit test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+        env:
+          CI: true
+
+  integration-test:
+    name: Integration test (docker compose)
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-build]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build dan jalankan 3 container
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Smoke test lewat nginx (frontend -> backend -> MySQL)
+        run: |
+          set -e
+          curl -fsS http://localhost:3000/ | grep -q '<div id="root">'
+          curl -fsS http://localhost:3000/api/health
+          curl -fsS -X POST http://localhost:3000/api/todos \
+               -H 'Content-Type: application/json' \
+               -d '{"title":"todo dari CI"}'
+          curl -fsS http://localhost:3000/api/todos | grep -q 'todo dari CI'
+          echo "Smoke test lulus"
+
+      - name: Tampilkan log kalau gagal
+        if: failure()
+        run: docker compose logs
+
+      - name: Bersihkan
+        if: always()
+        run: docker compose down -v
+
+  # ---------------------------------------------------------------- Build & push image
+  build-push:
+    name: Build & push ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: integration-test
+    # Jalan saat push ke main atau dijalankan manual (Run workflow) dari main
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [frontend, backend, mysql]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Nama owner GHCR (harus huruf kecil)
+        run: echo "GHCR_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tentukan tag image
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/todo-${{ matrix.service }}
+            ghcr.io/${{ env.GHCR_OWNER }}/todo-${{ matrix.service }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build & push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # ---------------------------------------------------------------- CD ke VPS
+  deploy:
+    name: Deploy ke VPS
+    runs-on: ubuntu-latest
+    needs: build-push
+    # Saklar deploy: job ini dilewati (abu-abu, bukan merah) sampai variable
+    # DEPLOY_ENABLED = true dibuat di Settings > Secrets and variables > Actions > Variables
+    if: vars.DEPLOY_ENABLED == 'true'
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Siapkan variabel deploy
+        run: |
+          echo "IMAGE_TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "IMAGE_PREFIX=docker.io/${{ secrets.DOCKERHUB_USERNAME }}" >> "$GITHUB_ENV"
+
+      - name: Kirim compose file ke VPS
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          source: deploy/docker-compose.prod.yml
+          target: ~/todo-app
+          strip_components: 1
+
+      - name: Pull image dan jalankan container
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          IMAGE_PREFIX: ${{ env.IMAGE_PREFIX }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          envs: IMAGE_TAG,IMAGE_PREFIX
+          script: |
+            set -e
+            cd ~/todo-app
+            test -f .env || { echo ".env belum ada di ~/todo-app"; exit 1; }
+
+            # Pakai Docker kalau ada, kalau tidak pakai Podman
+            if command -v docker >/dev/null 2>&1; then
+              COMPOSE="docker compose"
+            else
+              COMPOSE="podman compose"
+            fi
+
+            export IMAGE_TAG IMAGE_PREFIX
+            $COMPOSE -f docker-compose.prod.yml pull
+            $COMPOSE -f docker-compose.prod.yml up -d --remove-orphans
+
+            # Tunggu aplikasi siap, maksimal sekitar 2 menit
+            PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2); PORT=${PORT:-80}
+            for i in $(seq 1 24); do
+              if curl -fsS "http://localhost:${PORT}/api/health"; then
+                echo; echo "Deploy ${IMAGE_TAG} berhasil"
+                $COMPOSE -f docker-compose.prod.yml ps
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "Aplikasi tidak sehat setelah deploy"
+            $COMPOSE -f docker-compose.prod.yml logs --tail 50
+            exit 1
+
+      - name: Bersihkan image lama di VPS
+        if: success()
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script: |
+            if command -v docker >/dev/null 2>&1; then docker image prune -f; else podman image prune -f; fi
